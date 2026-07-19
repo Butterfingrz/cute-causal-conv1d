@@ -1,8 +1,15 @@
-# Causal depthwise conv1d in CuTe DSL
+# causal-conv1d: CuTe DSL rewrite
 
-This package implements causal depthwise 1D convolution for PyTorch with
+This repository is an API-compatible rewrite of `causal-conv1d` using
 [NVIDIA CuTe DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html).
-It supports FP32, FP16, and BF16 inputs and kernel widths 2, 3, and 4.
+It replaces the CUDA/C++ extension with Python-authored GPU kernels while
+preserving the public PyTorch interface, tensor layouts, state handling, and
+autograd behavior.
+
+The rewrite supports FP32, FP16, and BF16 inputs and kernel widths 2, 3, and 4.
+Existing code using `causal_conv1d_fn`, `causal_conv1d_update`, or
+`causal_conv1d_varlen_states` can keep the same call signatures and tensor
+formats.
 
 ## Installation
 
@@ -20,7 +27,7 @@ Requirements:
 - `nvidia-cutlass-dsl`
 - NVIDIA GPU supported by the installed CuTe DSL release
 
-## API
+## API compatibility
 
 ```python
 from causal_conv1d import causal_conv1d_fn
