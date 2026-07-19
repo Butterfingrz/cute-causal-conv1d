@@ -17,9 +17,11 @@ formats.
 pip install .
 ```
 
-Installation produces a pure-Python wheel and does not invoke a C++ compiler,
-`nvcc`, Ninja, or a custom CUDA extension build. CuTe DSL specializes and caches
-GPU kernels on first use for the active CUDA environment.
+**No installation-time compilation is required.** Installation produces a
+pure-Python wheel and avoids the CUDA/C++ extension build, which can take
+roughly 20-40 minutes depending on the hardware. It does not invoke a C++
+compiler, `nvcc`, or Ninja. CuTe DSL specializes and caches GPU kernels on first
+use for the active CUDA environment.
 
 Requirements:
 
