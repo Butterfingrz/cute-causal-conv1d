@@ -1,43 +1,66 @@
-# Causal depthwise conv1d in CUDA with a PyTorch interface
+# Causal depthwise conv1d in CuTe DSL
 
-Features:
-- Support fp32, fp16, bf16.
-- Kernel size 2, 3, 4.
+This package implements causal depthwise 1D convolution for PyTorch with
+[NVIDIA CuTe DSL](https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/cute_dsl_general/dsl_introduction.html).
+It supports FP32, FP16, and BF16 inputs and kernel widths 2, 3, and 4.
 
-## How to use
+## Installation
+
+```bash
+pip install .
+```
+
+Installation produces a pure-Python wheel and does not invoke a C++ compiler,
+`nvcc`, Ninja, or a custom CUDA extension build. CuTe DSL specializes and caches
+GPU kernels on first use for the active CUDA environment.
+
+Requirements:
+
+- PyTorch with CUDA support
+- `nvidia-cutlass-dsl`
+- NVIDIA GPU supported by the installed CuTe DSL release
+
+## API
 
 ```python
 from causal_conv1d import causal_conv1d_fn
+
+out = causal_conv1d_fn(x, weight, bias, activation="silu")
 ```
 
-```python
-def causal_conv1d_fn(x, weight, bias=None, activation=None):
-    """
-    x: (batch, dim, seqlen)
-    weight: (dim, width)
-    bias: (dim,)
-    activation: either None or "silu" or "swish"
+- `x`: `(batch, dim, seqlen)`
+- `weight`: `(dim, width)`
+- `bias`: optional `(dim,)`
+- `activation`: `None`, `"silu"`, or `"swish"`
 
-    out: (batch, dim, seqlen)
-    """
-```
+The operation is equivalent to:
 
-Equivalent to:
 ```python
 import torch.nn.functional as F
 
-F.conv1d(x, weight.unsqueeze(1), bias, padding=width - 1, groups=dim)[..., :seqlen]
+out = F.conv1d(
+    x,
+    weight.unsqueeze(1),
+    bias,
+    padding=weight.shape[1] - 1,
+    groups=x.shape[1],
+)[..., : x.shape[-1]]
 ```
 
-## Additional Prerequisites for AMD cards
+The package also provides `causal_conv1d_update` for convolution-state updates
+and `causal_conv1d_varlen_states` for packed variable-length state extraction.
 
-### Patching ROCm
+## Validation
 
-If you are on ROCm 6.0, run the following steps to avoid errors during compilation. This is not required for ROCm 6.1 onwards.
+The numerical and performance harnesses are in `tests/`:
 
-1. Locate your ROCm installation directory. This is typically found at `/opt/rocm/`, but may vary depending on your installation.
+```bash
+pytest -q tests/test_causal_conv1d.py
+python tests/benchmark_cutedsl_forward.py \
+  --cuda-graph --warmup 100 --iterations 1000 --repeats 5
+```
 
-2. Apply the Patch. Run with `sudo` in case you encounter permission issues.
-   ```bash
-    patch /opt/rocm/include/hip/amd_detail/amd_hip_bf16.h < rocm_patch/rocm6_0.patch 
-   ```
+The benchmark intentionally imports an installed `causal_conv1d_cuda` extension
+as the direct baseline; it is not a runtime dependency of this package. CUDA
+Graph replay removes Python and TVM-FFI launch overhead so this command compares
+the generated GPU kernels. Each result is the median of alternating-order runs.
