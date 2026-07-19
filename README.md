@@ -64,3 +64,23 @@ The benchmark intentionally imports an installed `causal_conv1d_cuda` extension
 as the direct baseline; it is not a runtime dependency of this package. CUDA
 Graph replay removes Python and TVM-FFI launch overhead so this command compares
 the generated GPU kernels. Each result is the median of alternating-order runs.
+
+### H100 results
+
+On NVIDIA H100, the CUDA Graph benchmark covered FP16 and BF16, kernel widths
+2-4, and eight representative tensor shapes (48 cases total). The CuTe DSL
+kernels matched or exceeded the installed CUDA extension in every case, with
+measured speedups from 1.008x to 1.199x.
+
+Nsight Compute measurements also covered both a latency-oriented case and a
+larger bandwidth-oriented case:
+
+| dtype | width | shape `(B, D, L)` | CUDA extension | CuTe DSL | speedup |
+| --- | ---: | --- | ---: | ---: | ---: |
+| FP16 | 3 | `(1, 2048, 2048)` | 9.70 us | 9.28 us | 1.045x |
+| BF16 | 4 | `(1, 4096, 2048)` | 15.74 us | 15.58 us | 1.010x |
+
+Both profiled CuTe DSL kernels had zero register spills. The dense numerical
+suite completed with 6,484 passing cases, 3,888 expected skips, and 2 expected
+xfails; dedicated update and packed variable-length suites added 1,620 and
+1,296 passing cases, respectively.
