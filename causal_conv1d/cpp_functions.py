@@ -54,6 +54,13 @@ def _causal_conv1d_torch(
     return out.to(dtype_in)
 
 
+def _last_history(history: torch.Tensor, length: int) -> torch.Tensor:
+    """Return the last ``length`` entries, left-padding short histories."""
+    if history.shape[-1] < length:
+        return F.pad(history, (length - history.shape[-1], 0))
+    return history[..., -length:]
+
+
 def causal_conv1d_fwd_function(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -77,9 +84,7 @@ def causal_conv1d_fwd_function(
         history = (
             x if initial_states is None else torch.cat((initial_states, x), dim=-1)
         )
-        final_states = F.pad(history, (width - 1 - history.shape[-1], 0))[
-            ..., -(width - 1) :
-        ]
+        final_states = _last_history(history, width - 1)
         final_states_out.copy_(final_states)
     return out
 
@@ -128,9 +133,7 @@ def causal_conv1d_bwd_function(
                 if initial_var is None
                 else torch.cat((initial_var, x_var), dim=-1)
             )
-            final = F.pad(history, (width - 1 - history.shape[-1], 0))[
-                ..., -(width - 1) :
-            ]
+            final = _last_history(history, width - 1)
             outputs.append(final)
             grad_outputs.append(dfinal_states)
         inputs = [x_var, weight_var]
@@ -145,17 +148,21 @@ def causal_conv1d_bwd_function(
     grad_idx += 1
     if dx is None:
         dx = computed_dx
-    else:
+    elif computed_dx is not None:
         dx.copy_(computed_dx)
-    dweight = grads[grad_idx].to(weight.dtype)
+    dweight = grads[grad_idx].to(weight.dtype) if grads[grad_idx] is not None else None
     grad_idx += 1
     dbias = None
     if bias is not None:
-        dbias = grads[grad_idx].to(bias.dtype)
+        dbias = grads[grad_idx].to(bias.dtype) if grads[grad_idx] is not None else None
         grad_idx += 1
     dinitial_states = None
     if initial_states is not None and return_dinitial_states:
-        dinitial_states = grads[grad_idx].to(initial_states.dtype)
+        dinitial_states = (
+            grads[grad_idx].to(initial_states.dtype)
+            if grads[grad_idx] is not None
+            else None
+        )
     return dx, dweight, dbias, dinitial_states
 
 
@@ -183,30 +190,49 @@ def causal_conv1d_update_function(
     batch, dim, seqlen = x.shape
     width = weight.shape[1]
     state_len = conv_state.shape[-1]
-    selected = (
-        conv_state
-        if conv_state_indices is None
-        else conv_state[conv_state_indices.long()]
-    )
-    if cache_seqlens is None:
-        x_new = torch.cat((selected, x), dim=-1).to(weight.dtype)
+    out = torch.zeros_like(x)
+
+    if conv_state_indices is None:
+        x_active = x
+        cache_seqlens_active = cache_seqlens
+        selected = conv_state
+    else:
+        valid = conv_state_indices >= 0
+        if not valid.any():
+            return out
+        x_active = x[valid]
+        indices_active = conv_state_indices[valid].long()
+        cache_seqlens_active = (
+            cache_seqlens[valid] if cache_seqlens is not None else None
+        )
+        selected = conv_state[indices_active]
+
+    if cache_seqlens_active is None:
+        x_new = torch.cat((selected, x_active), dim=-1).to(weight.dtype)
         selected.copy_(x_new[..., -state_len:].to(selected.dtype))
     else:
         history_idx = (
             torch.arange(-(width - 1), 0, device=x.device)[None, :]
-            + cache_seqlens[:, None]
+            + cache_seqlens_active[:, None]
         ).remainder(state_len)
         history_idx = history_idx[:, None, :].expand(-1, dim, -1)
-        x_new = torch.cat((selected.gather(2, history_idx), x), dim=-1).to(weight.dtype)
+        x_new = torch.cat((selected.gather(2, history_idx), x_active), dim=-1).to(
+            weight.dtype
+        )
         copy_idx = (
-            torch.arange(seqlen, device=x.device)[None, :] + cache_seqlens[:, None]
+            torch.arange(seqlen, device=x.device)[None, :]
+            + cache_seqlens_active[:, None]
         ).remainder(state_len)
         copy_idx = copy_idx[:, None, :].expand(-1, dim, -1)
-        selected.scatter_(2, copy_idx, x)
-    if conv_state_indices is not None:
-        valid = conv_state_indices >= 0
-        conv_state[conv_state_indices[valid].long()] = selected[valid]
-    out = F.conv1d(x_new, weight[:, None], bias, groups=dim)[..., -seqlen:]
+        selected.scatter_(2, copy_idx, x_active)
+
+    out_active = F.conv1d(x_new, weight[:, None], bias, groups=dim)[..., -seqlen:]
     if silu_activation:
-        out = F.silu(out)
-    return out.to(x.dtype)
+        out_active = F.silu(out_active)
+
+    if conv_state_indices is not None:
+        conv_state[indices_active] = selected
+        out[valid] = out_active.to(x.dtype)
+        return out
+
+    return out_active.to(x.dtype)
