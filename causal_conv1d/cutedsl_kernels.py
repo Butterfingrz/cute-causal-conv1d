@@ -6,8 +6,9 @@ no C++ or CUDA extension build step.
 
 from __future__ import annotations
 
-from functools import cache
 import operator
+import os
+from functools import cache
 
 import torch
 
@@ -674,6 +675,8 @@ def causal_conv1d_varlen_states_cutedsl(
 
 
 class _BackwardDxKernel:
+    """Layout-generic stateless input-gradient kernel."""
+
     THREADS = 256
 
     def __init__(self, width: int, has_bias: bool, silu: bool) -> None:
@@ -744,6 +747,8 @@ class _BackwardDxKernel:
 
 
 class _BackwardWeightKernel:
+    """Layout-generic stateless parameter-gradient kernel."""
+
     THREADS = 128
     WARPS = 4
 
@@ -846,6 +851,416 @@ class _BackwardWeightKernel:
                     dbias[channel] = value
 
 
+class _FusedChannelLastBackward:
+    """Fused stateless backward for aligned channel-last tensors."""
+
+    ALIGNMENT_BYTES = 16
+    CHANNEL_ALIGNMENT = 8
+    CHANNEL_TILE_BY_DTYPE = {
+        torch.bfloat16: 64,
+        torch.float32: 32,
+    }
+    COPY_BITS = 128
+    LONG_TILE_L = 128
+    MIN_COMPUTE_CAPABILITY_MAJOR = 8
+    SHORT_SEQUENCE_MAX = 128
+    SHORT_TILE_L = 64
+    THREADS = 128
+
+    @classmethod
+    def tile_l_for_seqlen(cls, seqlen: int) -> int:
+        if seqlen <= cls.SHORT_SEQUENCE_MAX:
+            return cls.SHORT_TILE_L
+        return cls.LONG_TILE_L
+
+    def __init__(
+        self,
+        width: int,
+        has_bias: bool,
+        silu: bool,
+        tile_l: int,
+        channel_tile: int,
+        channel_vec: int,
+        deterministic: bool,
+    ) -> None:
+        self.width = width
+        self.has_bias = has_bias
+        self.silu = silu
+        self.tile_l = tile_l
+        self.channel_tile = channel_tile
+        self.channel_vec = channel_vec
+        self.channel_group = self.THREADS // channel_tile
+        self.deterministic = deterministic
+        self.values_per_thread = tile_l // self.channel_group
+        vectors_per_row = channel_tile // channel_vec
+        rows_per_round = self.THREADS // vectors_per_row
+        if (
+            width not in (2, 3, 4)
+            or self.THREADS % channel_tile != 0
+            or channel_tile % channel_vec != 0
+            or self.THREADS % vectors_per_row != 0
+            or self.channel_group > 32
+            or 32 % self.channel_group != 0
+            or self.channel_group & (self.channel_group - 1) != 0
+            or tile_l % self.channel_group != 0
+            or tile_l % rows_per_round != 0
+            or width - 1 > rows_per_round
+        ):
+            raise ValueError("invalid fused backward tile configuration")
+
+    @cute.jit
+    def __call__(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        bias: cute.Tensor | None,
+        dout: cute.Tensor,
+        dx: cute.Tensor,
+        dweight_workspace: cute.Tensor,
+        dbias_workspace: cute.Tensor | None,
+        stream: CUstream,
+    ):
+        batch, dim, seqlen = x.shape
+        self.kernel(
+            x,
+            weight,
+            bias,
+            dout,
+            dx,
+            dweight_workspace,
+            dbias_workspace,
+        ).launch(
+            grid=(
+                batch,
+                cute.ceil_div(seqlen, self.tile_l),
+                cute.ceil_div(dim, self.channel_tile),
+            ),
+            block=(self.THREADS, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        x: cute.Tensor,
+        weight: cute.Tensor,
+        bias: cute.Tensor | None,
+        dout: cute.Tensor,
+        dx: cute.Tensor,
+        dweight_workspace: cute.Tensor,
+        dbias_workspace: cute.Tensor | None,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        batch_idx, tile_l_idx, tile_c_idx = cute.arch.block_idx()
+        dim = x.shape[1]
+        seqlen = x.shape[2]
+        halo = self.width - 1
+        l_base = tile_l_idx * self.tile_l
+        c_base = tile_c_idx * self.channel_tile
+
+        smem = cutlass.utils.SmemAllocator()
+        x_rows = self.tile_l + 2 * halo
+        dout_rows = self.tile_l + halo
+        sx = smem.allocate_tensor(
+            x.element_type,
+            cute.make_layout(
+                (x_rows, self.channel_tile),
+                stride=(self.channel_tile + self.channel_vec, 1),
+            ),
+            byte_alignment=self.ALIGNMENT_BYTES,
+        )
+        sdout = smem.allocate_tensor(
+            x.element_type,
+            cute.make_layout(
+                (dout_rows, self.channel_tile),
+                stride=(self.channel_tile + self.channel_vec, 1),
+            ),
+            byte_alignment=self.ALIGNMENT_BYTES,
+        )
+
+        vectors_per_row = self.channel_tile // self.channel_vec
+        rows_per_round = self.THREADS // vectors_per_row
+        row_in_round = tid // vectors_per_row
+        vector_in_row = tid % vectors_per_row
+        vector_global_c = c_base + vector_in_row * self.channel_vec
+        source_vector_idx = c_base // self.channel_vec + vector_in_row
+        copy_atom = cute.make_copy_atom(
+            cute.nvgpu.cpasync.CopyG2SOp(),
+            x.element_type,
+            num_bits_per_copy=self.COPY_BITS,
+        )
+
+        # Invalid causal halo and residue positions contribute zero. Clear the
+        # shared tiles before issuing only the valid 16-byte async copies.
+        for idx in range(tid, x_rows * self.channel_tile, self.THREADS):
+            sx[idx // self.channel_tile, idx % self.channel_tile] = x.element_type(
+                0.0
+            )
+        for idx in range(tid, dout_rows * self.channel_tile, self.THREADS):
+            sdout[idx // self.channel_tile, idx % self.channel_tile] = (
+                x.element_type(0.0)
+            )
+        cute.arch.sync_threads()
+
+        for row_base in cutlass.range_constexpr(
+            0, self.tile_l, rows_per_round
+        ):
+            local_l = row_base + row_in_round
+            global_l = l_base + local_l
+            if global_l < seqlen and vector_global_c < dim:
+                cute.copy(
+                    copy_atom,
+                    cute.local_tile(
+                        x[batch_idx, None, global_l],
+                        (self.channel_vec,),
+                        (source_vector_idx,),
+                    ),
+                    cute.local_tile(
+                        sx[halo + local_l, None],
+                        (self.channel_vec,),
+                        (vector_in_row,),
+                    ),
+                )
+                cute.copy(
+                    copy_atom,
+                    cute.local_tile(
+                        dout[batch_idx, None, global_l],
+                        (self.channel_vec,),
+                        (source_vector_idx,),
+                    ),
+                    cute.local_tile(
+                        sdout[local_l, None],
+                        (self.channel_vec,),
+                        (vector_in_row,),
+                    ),
+                )
+
+        if row_in_round < halo:
+            left_l = l_base + row_in_round - halo
+            if left_l >= 0 and vector_global_c < dim:
+                cute.copy(
+                    copy_atom,
+                    cute.local_tile(
+                        x[batch_idx, None, left_l],
+                        (self.channel_vec,),
+                        (source_vector_idx,),
+                    ),
+                    cute.local_tile(
+                        sx[row_in_round, None],
+                        (self.channel_vec,),
+                        (vector_in_row,),
+                    ),
+                )
+
+            right_l = l_base + self.tile_l + row_in_round
+            if right_l < seqlen and vector_global_c < dim:
+                cute.copy(
+                    copy_atom,
+                    cute.local_tile(
+                        dout[batch_idx, None, right_l],
+                        (self.channel_vec,),
+                        (source_vector_idx,),
+                    ),
+                    cute.local_tile(
+                        sdout[self.tile_l + row_in_round, None],
+                        (self.channel_vec,),
+                        (vector_in_row,),
+                    ),
+                )
+                if cutlass.const_expr(self.silu):
+                    cute.copy(
+                        copy_atom,
+                        cute.local_tile(
+                            x[batch_idx, None, right_l],
+                            (self.channel_vec,),
+                            (source_vector_idx,),
+                        ),
+                        cute.local_tile(
+                            sx[halo + self.tile_l + row_in_round, None],
+                            (self.channel_vec,),
+                            (vector_in_row,),
+                        ),
+                    )
+
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.sync_threads()
+
+        channel_in_tile = tid // self.channel_group
+        sequence_part = tid % self.channel_group
+        channel = c_base + channel_in_tile
+        sequence_base = sequence_part * self.values_per_thread
+
+        weight_values = cute.make_rmem_tensor((self.width,), Float32)
+        for w in cutlass.range_constexpr(self.width):
+            weight_values[w] = Float32(0.0)
+        bias_value = Float32(0.0)
+        if channel < dim:
+            for w in cutlass.range_constexpr(self.width):
+                weight_values[w] = Float32(weight[channel, w])
+            if cutlass.const_expr(self.has_bias):
+                bias_value = Float32(bias[channel])
+
+        dout_values = cute.make_rmem_tensor(
+            (halo + self.values_per_thread,), Float32
+        )
+        x_values = cute.make_rmem_tensor(
+            (2 * halo + self.values_per_thread,), Float32
+        )
+        for i in cutlass.range_constexpr(halo + self.values_per_thread):
+            dout_values[i] = Float32(sdout[sequence_base + i, channel_in_tile])
+            x_values[i] = Float32(sx[sequence_base + i, channel_in_tile])
+
+        if cutlass.const_expr(self.silu):
+            for i in cutlass.range_constexpr(
+                halo + self.values_per_thread,
+                2 * halo + self.values_per_thread,
+            ):
+                x_values[i] = Float32(sx[sequence_base + i, channel_in_tile])
+            for i in cutlass.range_constexpr(self.values_per_thread + halo):
+                preact = bias_value
+                for w in cutlass.range_constexpr(self.width):
+                    preact += weight_values[w] * x_values[i + w]
+                sigmoid = cute.arch.rcp_approx(
+                    Float32(1.0) + cute.math.exp(-preact, fastmath=True)
+                )
+                dout_values[i] *= sigmoid * (
+                    Float32(1.0) + preact * (Float32(1.0) - sigmoid)
+                )
+
+        dweight_partial = cute.make_rmem_tensor((self.width,), Float32)
+        for w in cutlass.range_constexpr(self.width):
+            dweight_partial[w] = Float32(0.0)
+        dbias_partial = Float32(0.0)
+        for i in cutlass.range_constexpr(self.values_per_thread):
+            grad = dout_values[i]
+            dbias_partial += grad
+            for w in cutlass.range_constexpr(self.width):
+                dweight_partial[w] += x_values[i + w] * grad
+
+        for w in cutlass.range_constexpr(self.width):
+            dweight_partial[w] = cute.arch.warp_reduction(
+                dweight_partial[w],
+                operator.add,
+                threads_in_group=self.channel_group,
+            )
+        if cutlass.const_expr(self.has_bias):
+            dbias_partial = cute.arch.warp_reduction(
+                dbias_partial,
+                operator.add,
+                threads_in_group=self.channel_group,
+            )
+
+        if sequence_part == 0 and channel < dim:
+            if cutlass.const_expr(self.deterministic):
+                for w in cutlass.range_constexpr(self.width):
+                    dweight_workspace[batch_idx, tile_l_idx, channel, w] = (
+                        dweight_partial[w]
+                    )
+                if cutlass.const_expr(self.has_bias):
+                    dbias_workspace[batch_idx, tile_l_idx, channel] = dbias_partial
+            else:
+                for w in cutlass.range_constexpr(self.width):
+                    cute.arch.atomic_add(
+                        dweight_workspace.iterator
+                        + dweight_workspace.layout((channel, w)),
+                        dweight_partial[w],
+                        scope="gpu",
+                    )
+                if cutlass.const_expr(self.has_bias):
+                    cute.arch.atomic_add(
+                        dbias_workspace.iterator + dbias_workspace.layout(channel),
+                        dbias_partial,
+                        scope="gpu",
+                    )
+
+        dx_values = cute.make_rmem_tensor((self.values_per_thread,), Float32)
+        for i in cutlass.range_constexpr(self.values_per_thread):
+            grad = Float32(0.0)
+            for w in cutlass.range_constexpr(self.width):
+                grad += (
+                    weight_values[self.width - 1 - w] * dout_values[i + w]
+                )
+            dx_values[i] = grad
+
+        # Reuse sx only after every thread has finished reading the input tile.
+        cute.arch.sync_threads()
+        for i in cutlass.range_constexpr(self.values_per_thread):
+            sx[halo + sequence_base + i, channel_in_tile] = dx_values[i].to(
+                x.element_type
+            )
+        cute.arch.sync_threads()
+
+        egress_c = c_base + tid % self.channel_tile
+        first_egress_row = tid // self.channel_tile
+        for row in range(
+            first_egress_row,
+            self.tile_l,
+            self.THREADS // self.channel_tile,
+        ):
+            global_l = l_base + row
+            if global_l < seqlen and egress_c < dim:
+                dx[batch_idx, egress_c, global_l] = sx[
+                    halo + row, tid % self.channel_tile
+                ]
+
+
+class _FusedReduceGradients:
+    """Reduce deterministic fused-backward workspaces in a fixed order."""
+
+    THREADS = 128
+
+    def __init__(self, width: int, has_bias: bool) -> None:
+        self.width = width
+        self.has_bias = has_bias
+
+    @cute.jit
+    def __call__(
+        self,
+        dweight_workspace: cute.Tensor,
+        dbias_workspace: cute.Tensor | None,
+        dweight: cute.Tensor,
+        dbias: cute.Tensor | None,
+        stream: CUstream,
+    ):
+        dim = dweight.shape[0]
+        self.kernel(dweight_workspace, dbias_workspace, dweight, dbias).launch(
+            grid=(cute.ceil_div(dim, self.THREADS), 1, 1),
+            block=(self.THREADS, 1, 1),
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        dweight_workspace: cute.Tensor,
+        dbias_workspace: cute.Tensor | None,
+        dweight: cute.Tensor,
+        dbias: cute.Tensor | None,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        block, _, _ = cute.arch.block_idx()
+        channel = block * self.THREADS + tid
+        dim = dweight.shape[0]
+        batch = dweight_workspace.shape[0]
+        sequence_tiles = dweight_workspace.shape[1]
+        if channel < dim:
+            for w in cutlass.range_constexpr(self.width):
+                value = Float32(0.0)
+                for batch_idx in range(batch):
+                    for tile_idx in range(sequence_tiles):
+                        value += dweight_workspace[
+                            batch_idx, tile_idx, channel, w
+                        ]
+                dweight[channel, w] = value
+            if cutlass.const_expr(self.has_bias):
+                value = Float32(0.0)
+                for batch_idx in range(batch):
+                    for tile_idx in range(sequence_tiles):
+                        value += dbias_workspace[batch_idx, tile_idx, channel]
+                dbias[channel] = value
+
+
 @cache
 def _compile_backward(
     input_dtype: torch.dtype,
@@ -892,21 +1307,341 @@ def _compile_backward(
     return dx_kernel, weight_kernel
 
 
+def _fake_deterministic_backward_workspaces(
+    batch,
+    sequence_tiles,
+    dim,
+    width: int,
+    has_bias: bool,
+):
+    """Build dynamic fake tensors shared by fused compile entry points."""
+    dweight_workspace = _fake_tensor(
+        Float32,
+        (batch, sequence_tiles, dim, width),
+        tuple(cute.sym_int64(divisibility=1) for _ in range(4)),
+        4,
+    )
+    dbias_workspace = (
+        _fake_tensor(
+            Float32,
+            (batch, sequence_tiles, dim),
+            tuple(cute.sym_int64(divisibility=1) for _ in range(3)),
+            4,
+        )
+        if has_bias
+        else None
+    )
+    return dweight_workspace, dbias_workspace
+
+
+@cache
+def _compile_fused_channel_last_backward(
+    input_dtype: torch.dtype,
+    weight_dtype: torch.dtype,
+    width: int,
+    has_bias: bool,
+    silu: bool,
+    tile_l: int,
+    deterministic: bool,
+):
+    x_dtype = _TORCH_TO_CUTE[input_dtype]
+    weight_dtype_cute = _TORCH_TO_CUTE[weight_dtype]
+    if input_dtype not in _FusedChannelLastBackward.CHANNEL_TILE_BY_DTYPE:
+        raise ValueError("fused backward only supports bfloat16 and float32 inputs")
+    channel_tile = _FusedChannelLastBackward.CHANNEL_TILE_BY_DTYPE[input_dtype]
+    channel_vec = _FusedChannelLastBackward.COPY_BITS // x_dtype.width
+    if channel_vec * x_dtype.width != _FusedChannelLastBackward.COPY_BITS:
+        raise ValueError("fused backward requires exact 128-bit input vectors")
+
+    batch, dim, seqlen = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    x_batch_stride = cute.sym_int64(divisibility=channel_vec)
+    x_seqlen_stride = cute.sym_int64(divisibility=channel_vec)
+    x = _fake_tensor(
+        x_dtype,
+        (batch, dim, seqlen),
+        (x_batch_stride, 1, x_seqlen_stride),
+        _FusedChannelLastBackward.ALIGNMENT_BYTES,
+    )
+    dout_batch_stride = cute.sym_int64(divisibility=channel_vec)
+    dout_seqlen_stride = cute.sym_int64(divisibility=channel_vec)
+    dout = _fake_tensor(
+        x_dtype,
+        (batch, dim, seqlen),
+        (dout_batch_stride, 1, dout_seqlen_stride),
+        _FusedChannelLastBackward.ALIGNMENT_BYTES,
+    )
+    dx_batch_stride = cute.sym_int64(divisibility=channel_vec)
+    dx_seqlen_stride = cute.sym_int64(divisibility=channel_vec)
+    dx = _fake_tensor(
+        x_dtype,
+        (batch, dim, seqlen),
+        (dx_batch_stride, 1, dx_seqlen_stride),
+        _FusedChannelLastBackward.ALIGNMENT_BYTES,
+    )
+    weight = _fake_tensor(
+        weight_dtype_cute,
+        (dim, width),
+        (width, 1),
+        weight_dtype_cute.width // 8,
+    )
+    bias = (
+        _fake_tensor(
+            weight_dtype_cute,
+            (dim,),
+            (1,),
+            weight_dtype_cute.width // 8,
+        )
+        if has_bias
+        else None
+    )
+
+    if deterministic:
+        sequence_tiles = cute.sym_int()
+        dweight_workspace, dbias_workspace = (
+            _fake_deterministic_backward_workspaces(
+                batch,
+                sequence_tiles,
+                dim,
+                width,
+                has_bias,
+            )
+        )
+    else:
+        dweight_workspace = _fake_tensor(
+            Float32, (dim, width), (width, 1), 4
+        )
+        dbias_workspace = (
+            _fake_tensor(Float32, (dim,), (1,), 4) if has_bias else None
+        )
+
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        _FusedChannelLastBackward(
+            width,
+            has_bias,
+            silu,
+            tile_l,
+            channel_tile,
+            channel_vec,
+            deterministic,
+        ),
+        x,
+        weight,
+        bias,
+        dout,
+        dx,
+        dweight_workspace,
+        dbias_workspace,
+        stream,
+        options="--enable-tvm-ffi",
+    )
+
+
+@cache
+def _compile_fused_reduce_gradients(width: int, has_bias: bool):
+    batch, sequence_tiles, dim = cute.sym_int(), cute.sym_int(), cute.sym_int()
+    dweight_workspace, dbias_workspace = (
+        _fake_deterministic_backward_workspaces(
+            batch,
+            sequence_tiles,
+            dim,
+            width,
+            has_bias,
+        )
+    )
+    dweight = _fake_tensor(Float32, (dim, width), (width, 1), 4)
+    dbias = _fake_tensor(Float32, (dim,), (1,), 4) if has_bias else None
+    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    return cute.compile(
+        _FusedReduceGradients(width, has_bias),
+        dweight_workspace,
+        dbias_workspace,
+        dweight,
+        dbias,
+        stream,
+        options="--enable-tvm-ffi",
+    )
+
+
+def _use_deterministic_mode() -> bool:
+    """Match the native CUDA environment/global deterministic selector."""
+    value = os.environ.get("CAUSAL_CONV1D_DETERMINISTIC")
+    if value:
+        if value[0] == "1":
+            return True
+        if value[0] == "0":
+            return False
+    return torch.are_deterministic_algorithms_enabled()
+
+
+def _can_use_fused_channel_last_backward(
+    x: torch.Tensor,
+    dout: torch.Tensor,
+    dx: torch.Tensor,
+) -> bool:
+    """Return whether tensors satisfy every fused 128-bit copy contract."""
+    tensors = (x, dout, dx)
+    if (
+        x.ndim != 3
+        or x.dtype not in (torch.bfloat16, torch.float32)
+        or any(t.ndim != 3 for t in tensors)
+        or any(t.shape != x.shape for t in tensors)
+        or any(t.dtype != x.dtype for t in tensors)
+        or any(not t.is_cuda or t.device != x.device for t in tensors)
+        or x.shape[1] % _FusedChannelLastBackward.CHANNEL_ALIGNMENT != 0
+        or any(t.stride(1) != 1 for t in tensors)
+    ):
+        return False
+
+    if (
+        torch.cuda.get_device_capability(x.device)[0]
+        < _FusedChannelLastBackward.MIN_COMPUTE_CAPABILITY_MAJOR
+    ):
+        return False
+
+    alignment = _FusedChannelLastBackward.ALIGNMENT_BYTES
+    vector_elems = alignment // x.element_size()
+    return all(
+        t.data_ptr() % alignment == 0
+        and t.stride(0) % vector_elems == 0
+        and t.stride(2) % vector_elems == 0
+        for t in tensors
+    )
+
+
+def _launch_fused_channel_last_backward(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    dout: torch.Tensor,
+    dx: torch.Tensor,
+    silu_activation: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Allocate gradients and launch the fused channel-last specialization."""
+    width = weight.shape[1]
+    has_bias = bias is not None
+    tile_l = _FusedChannelLastBackward.tile_l_for_seqlen(x.shape[2])
+    deterministic = _use_deterministic_mode()
+    fused_kernel = _compile_fused_channel_last_backward(
+        x.dtype,
+        weight.dtype,
+        width,
+        has_bias,
+        silu_activation,
+        tile_l,
+        deterministic,
+    )
+
+    if deterministic:
+        sequence_tiles = (x.shape[2] + tile_l - 1) // tile_l
+        dweight_workspace = torch.empty(
+            (x.shape[0], sequence_tiles, x.shape[1], width),
+            device=x.device,
+            dtype=torch.float32,
+        )
+        dbias_workspace = (
+            torch.empty(
+                (x.shape[0], sequence_tiles, x.shape[1]),
+                device=x.device,
+                dtype=torch.float32,
+            )
+            if has_bias
+            else None
+        )
+        dweight = torch.empty(
+            (x.shape[1], width),
+            device=x.device,
+            dtype=torch.float32,
+        )
+        dbias = (
+            torch.empty(x.shape[1], device=x.device, dtype=torch.float32)
+            if has_bias
+            else None
+        )
+        fused_kernel(
+            x,
+            weight,
+            bias,
+            dout,
+            dx,
+            dweight_workspace,
+            dbias_workspace,
+        )
+        reduce_kernel = _compile_fused_reduce_gradients(width, has_bias)
+        reduce_kernel(
+            dweight_workspace,
+            dbias_workspace,
+            dweight,
+            dbias,
+        )
+        return dweight, dbias
+
+    # The fast reducer uses atomics, so its destinations must start at zero.
+    dweight = torch.zeros(
+        (x.shape[1], width),
+        device=x.device,
+        dtype=torch.float32,
+    )
+    dbias = (
+        torch.zeros(x.shape[1], device=x.device, dtype=torch.float32)
+        if has_bias
+        else None
+    )
+    fused_kernel(x, weight, bias, dout, dx, dweight, dbias)
+    return dweight, dbias
+
+
+def _launch_generic_backward(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    dout: torch.Tensor,
+    dx: torch.Tensor,
+    silu_activation: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Launch the layout-generic two-kernel backward fallback."""
+    has_bias = bias is not None
+    dweight = torch.empty_like(weight, dtype=torch.float32)
+    dbias = torch.empty_like(bias, dtype=torch.float32) if has_bias else None
+    dx_kernel, weight_kernel = _compile_backward(
+        x.dtype,
+        weight.dtype,
+        weight.shape[1],
+        has_bias,
+        silu_activation,
+    )
+    dx_kernel(x, weight, bias, dout, dx)
+    weight_kernel(x, weight, bias, dout, dweight, dbias)
+    return dweight, dbias
+
+
 def causal_conv1d_bwd_cutedsl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
     dout: torch.Tensor,
     silu_activation: bool,
-):
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Run stateless backward through the fused path or generic fallback."""
     dx = torch.empty_like(x)
-    dweight = torch.empty_like(weight, dtype=torch.float32)
-    dbias = torch.empty_like(bias, dtype=torch.float32) if bias is not None else None
-    dx_kernel, weight_kernel = _compile_backward(
-        x.dtype, weight.dtype, weight.shape[1], bias is not None, silu_activation
-    )
-    dx_kernel(x, weight, bias, dout, dx)
-    weight_kernel(x, weight, bias, dout, dweight, dbias)
+    if _can_use_fused_channel_last_backward(x, dout, dx):
+        dweight, dbias = _launch_fused_channel_last_backward(
+            x,
+            weight,
+            bias,
+            dout,
+            dx,
+            silu_activation,
+        )
+    else:
+        dweight, dbias = _launch_generic_backward(
+            x,
+            weight,
+            bias,
+            dout,
+            dx,
+            silu_activation,
+        )
     return (
         dx,
         dweight.to(weight.dtype),

@@ -395,7 +395,7 @@ def test_causal_conv1d_race_condition(seqlen, width, has_bias, silu_activation, 
         assert torch.equal(dx, dx0)
         assert dw_equal
         if has_bias:
-            assert dw_equal
+            assert db_equal
 
 
 @pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
